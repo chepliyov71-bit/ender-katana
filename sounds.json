@@ -1,0 +1,19 @@
+package com.voidforge.enderkatana.network;
+
+public final class KatanaClientSync {
+    public static volatile int energy;
+    public static volatile int dashCooldown;
+    public static volatile int slashCooldown;
+    public static volatile boolean empowered;
+    public static volatile boolean absoluteForm;
+
+    public static void accept(EnergySyncPayload payload) {
+        energy = Math.max(0, Math.min(100, payload.energy()));
+        dashCooldown = Math.max(0, payload.dashCooldown());
+        slashCooldown = Math.max(0, payload.slashCooldown());
+        empowered = payload.empowered();
+        absoluteForm = payload.absoluteForm();
+    }
+
+    private KatanaClientSync() {}
+}

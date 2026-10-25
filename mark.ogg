@@ -1,0 +1,25 @@
+package com.voidforge.enderkatana;
+
+import com.voidforge.enderkatana.config.KatanaConfig;
+import com.voidforge.enderkatana.network.KatanaNetwork;
+import com.voidforge.enderkatana.registry.ModCreativeTabs;
+import com.voidforge.enderkatana.registry.ModItems;
+import com.voidforge.enderkatana.registry.ModSounds;
+import net.neoforged.bus.api.IEventBus;
+import net.neoforged.fml.ModContainer;
+import net.neoforged.fml.common.Mod;
+import net.neoforged.fml.config.ModConfig;
+import net.neoforged.fml.javafmlmod.FMLJavaModLoadingContext;
+
+@Mod(EnderKatana.MOD_ID)
+public final class EnderKatana {
+    public static final String MOD_ID = "enderkatana";
+
+    public EnderKatana(IEventBus modBus, ModContainer container) {
+        ModItems.ITEMS.register(modBus);
+        ModSounds.SOUNDS.register(modBus);
+        ModCreativeTabs.TABS.register(modBus);
+        modBus.addListener(KatanaNetwork::registerPayloads);
+        container.registerConfig(ModConfig.Type.COMMON, KatanaConfig.SPEC);
+    }
+}

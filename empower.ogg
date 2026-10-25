@@ -1,0 +1,62 @@
+package com.voidforge.enderkatana.item;
+
+import com.voidforge.enderkatana.ability.KatanaAbilityService;
+import com.voidforge.enderkatana.config.KatanaConfig;
+import net.minecraft.ChatFormatting;
+import net.minecraft.network.chat.Component;
+import net.minecraft.world.entity.LivingEntity;
+import net.minecraft.world.entity.player.Player;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.Rarity;
+import net.minecraft.world.item.SwordItem;
+import net.minecraft.world.item.Tier;
+import net.minecraft.world.item.crafting.Ingredient;
+import net.minecraft.world.item.Items;
+import net.minecraft.tags.BlockTags;
+import net.neoforged.neoforge.common.SimpleTier;
+import net.minecraft.world.item.TooltipFlag;
+import net.minecraft.world.level.Level;
+import java.util.List;
+
+public final class EnderKatanaItem extends SwordItem {
+    private static final Tier KATANA_TIER = new SimpleTier(
+            BlockTags.INCORRECT_FOR_NETHERITE_TOOL,
+            KatanaConfig.DURABILITY.get(),
+            9.0F,
+            3.0F,
+            18,
+            () -> Ingredient.of(Items.NETHERITE_INGOT));
+    private final boolean absolute;
+
+    public EnderKatanaItem(boolean absolute) {
+        super(KATANA_TIER, new Properties()
+                .durability(KatanaConfig.DURABILITY.get())
+                .rarity(Rarity.EPIC)
+                .fireResistant()
+                .enchantable(18)
+                .attributes(SwordItem.createAttributes(KATANA_TIER, absolute ? 10 : 7, absolute ? -2.0F : -2.2F)));
+        this.absolute = absolute;
+    }
+
+    public boolean isAbsoluteForm() {
+        return absolute;
+    }
+
+    @Override
+    public boolean hurtEnemy(ItemStack stack, LivingEntity target, LivingEntity attacker) {
+        boolean result = super.hurtEnemy(stack, target, attacker);
+        if (!attacker.level().isClientSide && attacker instanceof Player player) {
+            KatanaAbilityService.onKatanaHit(player, target, absolute);
+        }
+        return result;
+    }
+
+    @Override
+    public void appendHoverText(ItemStack stack, TooltipContext context, List<Component> tooltip, TooltipFlag flag) {
+        super.appendHoverText(stack, context, tooltip, flag);
+        tooltip.add(Component.translatable("tooltip.enderkatana.damage", absolute ? KatanaConfig.ABSOLUTE_ATTACK_DAMAGE.get() : KatanaConfig.BASE_ATTACK_DAMAGE.get()).withStyle(ChatFormatting.DARK_PURPLE));
+        tooltip.add(Component.translatable("tooltip.enderkatana.energy").withStyle(ChatFormatting.LIGHT_PURPLE));
+        tooltip.add(Component.translatable(absolute ? "tooltip.enderkatana.absolute" : "tooltip.enderkatana.normal").withStyle(ChatFormatting.GRAY));
+        tooltip.add(Component.translatable("tooltip.enderkatana.controls").withStyle(ChatFormatting.DARK_GRAY));
+    }
+}

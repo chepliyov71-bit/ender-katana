@@ -1,0 +1,538 @@
+package com.voidforge.enderkatana.ability;
+
+import com.voidforge.enderkatana.config.KatanaConfig;
+import com.voidforge.enderkatana.network.EnergySyncPayload;
+import com.voidforge.enderkatana.registry.ModItems;
+import com.voidforge.enderkatana.registry.ModSounds;
+import net.minecraft.core.BlockPos;
+import net.minecraft.core.particles.ParticleTypes;
+import net.minecraft.network.chat.Component;
+import net.minecraft.resources.ResourceKey;
+import net.minecraft.resources.ResourceLocation;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.sounds.SoundEvents;
+import net.minecraft.sounds.SoundSource;
+import net.minecraft.world.damagesource.DamageSource;
+import net.minecraft.world.effect.MobEffectInstance;
+import net.minecraft.world.effect.MobEffects;
+import net.minecraft.world.entity.Entity;
+import net.minecraft.world.entity.LivingEntity;
+import net.minecraft.world.entity.boss.enderdragon.EnderDragon;
+import net.minecraft.world.entity.boss.wither.WitherBoss;
+import net.minecraft.world.entity.ai.attributes.AttributeInstance;
+import net.minecraft.world.entity.ai.attributes.AttributeModifier;
+import net.minecraft.world.entity.ai.attributes.Attributes;
+import net.minecraft.world.entity.player.Player;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.level.ClipContext;
+import net.minecraft.world.level.Level;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.phys.AABB;
+import net.minecraft.world.phys.BlockHitResult;
+import net.minecraft.world.phys.HitResult;
+import net.minecraft.world.phys.Vec3;
+import net.neoforged.neoforge.network.PacketDistributor;
+
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.List;
+import java.util.Map;
+import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
+
+public final class KatanaAbilityService {
+    public static final int DASH = 0;
+    public static final int SPATIAL_SLASH = 1;
+    public static final int MARK_TELEPORT = 2;
+    public static final int RETURN_POINT = 3;
+    public static final int DRAGON_WRATH = 4;
+    public static final int EMPOWER = 5;
+
+    private static final ResourceLocation ATTACK_SPEED_ID = ResourceLocation.fromNamespaceAndPath("enderkatana", "void_rhythm_attack_speed");
+    private static final Map<UUID, PlayerState> STATES = new ConcurrentHashMap<>();
+
+    private KatanaAbilityService() {}
+
+    private static PlayerState state(Player player) {
+        return STATES.computeIfAbsent(player.getUUID(), ignored -> new PlayerState());
+    }
+
+    public static boolean hasKatana(Player player) {
+        return isKatana(player.getMainHandItem()) || isKatana(player.getOffhandItem());
+    }
+
+    public static boolean isAbsolute(Player player) {
+        return player.getMainHandItem().is(ModItems.ABSOLUTE_KATANA.get()) || player.getOffhandItem().is(ModItems.ABSOLUTE_KATANA.get());
+    }
+
+    private static boolean isKatana(ItemStack stack) {
+        return stack.is(ModItems.ENDER_KATANA.get()) || stack.is(ModItems.ABSOLUTE_KATANA.get());
+    }
+
+    public static void onKatanaHit(Player player, LivingEntity target, boolean absolute) {
+        if (!(player instanceof ServerPlayer serverPlayer) || !(serverPlayer.level() instanceof ServerLevel level)) return;
+        PlayerState s = state(player);
+        long now = level.getGameTime();
+        if (now - s.lastHitAt > 30) s.comboStep = 0;
+        s.comboStep = s.comboStep % 3 + 1;
+        s.lastHitAt = now;
+        addEnergy(s, KatanaConfig.HIT_ENERGY.get() + (absolute ? 3 : 0));
+        s.markedTarget = target;
+        s.markExpiresAt = now + KatanaConfig.MARK_DURATION_TICKS.get();
+        ring(level, target.position().add(0, target.getBbHeight() * 0.55, 0), 5, 0.55, ParticleTypes.REVERSE_PORTAL);
+        level.sendParticles(ParticleTypes.END_ROD, target.getX(), target.getY() + target.getBbHeight() * 0.55, target.getZ(), 3, 0.22, 0.28, 0.22, 0.02);
+        if (s.comboStep == 3) {
+            addEnergy(s, KatanaConfig.COMBO_ENERGY.get());
+            spatialBurst(serverPlayer, target.position().add(0, target.getBbHeight() * 0.5, 0), 2.3, absolute ? 4.5 : 3.0, false);
+            level.playSound(null, target.blockPosition(), ModSounds.SLASH.get(), SoundSource.PLAYERS, 0.9F, 0.7F);
+        }
+    }
+
+    public static void activate(ServerPlayer player, int ability) {
+        if (!hasKatana(player)) return;
+        if (player.isSpectator() || player.isSleeping()) return;
+        switch (ability) {
+            case DASH -> dash(player);
+            case SPATIAL_SLASH -> spatialSlash(player);
+            case MARK_TELEPORT -> markTeleport(player);
+            case RETURN_POINT -> returnPoint(player);
+            case DRAGON_WRATH -> dragonWrath(player);
+            case EMPOWER -> empower(player);
+            default -> { }
+        }
+    }
+
+    public static void tick(ServerPlayer player) {
+        PlayerState s = state(player);
+        ServerLevel level = player.serverLevel();
+        long now = level.getGameTime();
+
+        if (s.markedTarget != null && (!s.markedTarget.isAlive() || s.markedTarget.level() != level || now > s.markExpiresAt)) {
+            s.markedTarget = null;
+        } else if (s.markedTarget != null && now % 4 == 0) {
+            level.sendParticles(ParticleTypes.REVERSE_PORTAL, s.markedTarget.getX(), s.markedTarget.getY() + s.markedTarget.getBbHeight() * .75, s.markedTarget.getZ(), 3, .35, .25, .35, .01);
+        }
+        if (s.returnPoint != null && (!level.dimension().equals(s.returnDimension) || now > s.returnExpiresAt)) {
+            s.returnPoint = null;
+        }
+        if (s.empoweredUntil > 0 && now >= s.empoweredUntil) {
+            s.empoweredUntil = 0;
+            removeAttackSpeedModifier(player);
+            player.removeEffect(MobEffects.DAMAGE_BOOST);
+            action(player, "message.enderkatana.empower_ended");
+        }
+        if (s.empoweredUntil > now && now % 4 == 0) {
+            ring(level, player.position().add(0, 0.9, 0), 8, 0.85, ParticleTypes.REVERSE_PORTAL);
+            level.sendParticles(ParticleTypes.END_ROD, player.getX(), player.getY() + 1.0, player.getZ(), 2, 0.35, 0.5, 0.35, 0.03);
+        }
+        if (s.pendingUltimateAt >= 0) {
+            if (now < s.pendingUltimateAt) {
+                if (now % 3 == 0) ring(level, s.ultimateOrigin, 48, 2.4, ParticleTypes.PORTAL);
+                if (s.ultimateAbsolute && now % 2 == 0) freezeNearby(player, 6.0, 4);
+            } else {
+                executeUltimate(player, s);
+                s.pendingUltimateAt = -1;
+            }
+        }
+        if (now % 5 == 0) {
+            PacketDistributor.sendToPlayer(player, new EnergySyncPayload(
+                    s.energy,
+                    (int) Math.max(0, s.dashReadyAt - now),
+                    (int) Math.max(0, s.slashReadyAt - now),
+                    s.empoweredUntil > now,
+                    isAbsolute(player)));
+        }
+    }
+
+    private static void dash(ServerPlayer player) {
+        ServerLevel level = player.serverLevel();
+        PlayerState s = state(player);
+        long now = level.getGameTime();
+        if (now < s.dashReadyAt) { cooldownMessage(player, s.dashReadyAt - now); return; }
+        double distance = KatanaConfig.DASH_DISTANCE.get() * (s.empoweredUntil > now ? 1.35 : 1.0) * (isAbsolute(player) ? 1.15 : 1.0);
+        Vec3 origin = player.position();
+        Vec3 look = player.getLookAngle().normalize();
+        boolean moved = false;
+        for (double d = distance; d >= 1.0 && !moved; d -= 0.5) {
+            Vec3 candidate = origin.add(look.scale(d));
+            double[] offsets = {0, 1, -1, 2, -2};
+            for (double y : offsets) {
+                Vec3 adjusted = candidate.add(0, y, 0);
+                if (safeLocation(player, adjusted)) {
+                    moved = safeTeleport(player, adjusted);
+                    if (moved) break;
+                }
+            }
+        }
+        if (!moved) {
+            action(player, "message.enderkatana.teleport_blocked");
+            return;
+        }
+        s.dashReadyAt = now + KatanaConfig.DASH_COOLDOWN_TICKS.get();
+        if (s.energy >= KatanaConfig.DASH_ENERGY_COST.get()) s.energy -= KatanaConfig.DASH_ENERGY_COST.get();
+        ring(level, origin.add(0, 0.8, 0), 22, 0.75, ParticleTypes.REVERSE_PORTAL);
+        ring(level, player.position().add(0, 0.8, 0), 26, 0.8, ParticleTypes.PORTAL);
+        level.playSound(null, player.blockPosition(), ModSounds.RIFT.get(), SoundSource.PLAYERS, 0.95F, 0.8F + level.random.nextFloat() * 0.18F);
+        LivingEntity near = nearestTarget(player, player.position(), 2.2);
+        if (near != null) near.hurt(player.damageSources().playerAttack(player), KatanaConfig.DASH_BONUS_DAMAGE.get());
+    }
+
+    private static void spatialSlash(ServerPlayer player) {
+        ServerLevel level = player.serverLevel();
+        PlayerState s = state(player);
+        long now = level.getGameTime();
+        if (now < s.slashReadyAt) { cooldownMessage(player, s.slashReadyAt - now); return; }
+        int cost = KatanaConfig.SLASH_ENERGY_COST.get();
+        if (s.energy < cost) { action(player, "message.enderkatana.not_enough_energy"); return; }
+        s.energy -= cost;
+        s.slashReadyAt = now + KatanaConfig.SLASH_COOLDOWN_TICKS.get();
+        double range = KatanaConfig.SLASH_RANGE.get() * (s.empoweredUntil > now ? 1.2 : 1.0);
+        Vec3 start = player.getEyePosition();
+        Vec3 look = player.getLookAngle().normalize();
+        Vec3 end = start.add(look.scale(range));
+        HitResult blockHit = level.clip(new ClipContext(start, end, ClipContext.Block.COLLIDER, ClipContext.Fluid.NONE, player));
+        if (blockHit.getType() == HitResult.Type.BLOCK) range = Math.min(range, start.distanceTo(blockHit.getLocation()));
+        final double hitRange = range;
+        AABB scan = player.getBoundingBox().expandTowards(look.scale(hitRange)).inflate(1.6, 1.3, 1.6);
+        List<LivingEntity> targets = level.getEntitiesOfClass(LivingEntity.class, scan,
+                e -> e != player && e.isAlive() && !e.isAlliedTo(player) && player.hasLineOfSight(e))
+                .stream().filter(e -> {
+                    Vec3 delta = e.getBoundingBox().getCenter().subtract(start);
+                    double along = delta.dot(look);
+                    return along > 0 && along <= hitRange && delta.subtract(look.scale(along)).length() <= 1.25;
+                }).sorted(Comparator.comparingDouble(e -> e.position().distanceToSqr(player.position()))).toList();
+
+        for (int i = 0; i < 26; i++) {
+            double t = hitRange * i / 25.0;
+            Vec3 p = start.add(look.scale(t));
+            level.sendParticles(i % 3 == 0 ? ParticleTypes.REVERSE_PORTAL : ParticleTypes.PORTAL, p.x, p.y, p.z, 2, 0.14, 0.14, 0.14, 0.01);
+            level.sendParticles(ParticleTypes.END_ROD, p.x, p.y, p.z, 1, 0.04, 0.04, 0.04, 0.005);
+        }
+        level.playSound(null, player.blockPosition(), ModSounds.SLASH.get(), SoundSource.PLAYERS, 1.1F, 0.62F);
+        int index = 0;
+        for (LivingEntity target : targets) {
+            double damage = index == 0 ? KatanaConfig.SLASH_DAMAGE.get() : KatanaConfig.SECONDARY_SLASH_DAMAGE.get();
+            target.hurt(player.damageSources().playerAttack(player), limitBossDamage(target, damage));
+            state(player).markedTarget = target;
+            state(player).markExpiresAt = now + KatanaConfig.MARK_DURATION_TICKS.get();
+            ring(level, target.position().add(0, target.getBbHeight() * .55, 0), 10, .7, ParticleTypes.REVERSE_PORTAL);
+            index++;
+        }
+    }
+
+    private static void markTeleport(ServerPlayer player) {
+        ServerLevel level = player.serverLevel();
+        PlayerState s = state(player);
+        long now = level.getGameTime();
+        LivingEntity target = s.markedTarget;
+        if (target == null || !target.isAlive() || target.level() != level || now > s.markExpiresAt) {
+            target = nearestLookTarget(player, 7.0);
+            if (target == null) { action(player, "message.enderkatana.no_mark"); return; }
+            s.markedTarget = target;
+            s.markExpiresAt = now + KatanaConfig.MARK_DURATION_TICKS.get();
+            ring(level, target.position().add(0, target.getBbHeight() * .5, 0), 18, .8, ParticleTypes.PORTAL);
+            action(player, "message.enderkatana.marked");
+            return;
+        }
+        int cost = 15;
+        if (s.energy < cost) { action(player, "message.enderkatana.not_enough_energy"); return; }
+        Vec3 old = player.position();
+        Vec3 behind = target.position().subtract(target.getLookAngle().normalize().scale(1.35)).add(0, 0.1, 0);
+        if (!safeTeleport(player, behind)) {
+            Vec3 side = target.position().add(1.4, 0.1, 0);
+            if (!safeTeleport(player, side)) { action(player, "message.enderkatana.teleport_blocked"); return; }
+        }
+        s.energy -= cost;
+        ring(level, old.add(0, .8, 0), 20, .7, ParticleTypes.REVERSE_PORTAL);
+        ring(level, player.position().add(0, .8, 0), 20, .7, ParticleTypes.PORTAL);
+        target.hurt(player.damageSources().playerAttack(player), isAbsolute(player) ? 8 : 5);
+        level.playSound(null, player.blockPosition(), ModSounds.RIFT.get(), SoundSource.PLAYERS, 1.0F, 1.15F);
+        s.markedTarget = null;
+    }
+
+    private static void returnPoint(ServerPlayer player) {
+        ServerLevel level = player.serverLevel();
+        PlayerState s = state(player);
+        long now = level.getGameTime();
+        if (s.returnPoint == null || !level.dimension().equals(s.returnDimension) || now > s.returnExpiresAt) {
+            s.returnPoint = player.position();
+            s.returnDimension = level.dimension();
+            s.returnExpiresAt = now + KatanaConfig.RETURN_DURATION_TICKS.get();
+            ring(level, s.returnPoint.add(0, .15, 0), 24, 1.0, ParticleTypes.PORTAL);
+            level.playSound(null, player.blockPosition(), ModSounds.MARK.get(), SoundSource.PLAYERS, .85F, .7F);
+            action(player, "message.enderkatana.point_set");
+            return;
+        }
+        if (s.energy < KatanaConfig.RETURN_ENERGY_COST.get()) { action(player, "message.enderkatana.not_enough_energy"); return; }
+        Vec3 destination = s.returnPoint;
+        if (!safeLocation(player, destination) && !findNearbySafe(player, destination)) {
+            action(player, "message.enderkatana.return_blocked");
+            return;
+        }
+        Vec3 old = player.position();
+        Vec3 safe = resolveSafePoint(player, destination);
+        if (safe == null) { action(player, "message.enderkatana.return_blocked"); return; }
+        if (!safeTeleport(player, safe)) { action(player, "message.enderkatana.return_blocked"); return; }
+        s.energy -= KatanaConfig.RETURN_ENERGY_COST.get();
+        s.returnPoint = null;
+        ring(level, old.add(0, .8, 0), 28, 1.1, ParticleTypes.REVERSE_PORTAL);
+        ring(level, player.position().add(0, .8, 0), 30, 1.1, ParticleTypes.PORTAL);
+        level.playSound(null, player.blockPosition(), ModSounds.RIFT.get(), SoundSource.PLAYERS, 1.15F, .55F);
+    }
+
+    private static boolean findNearbySafe(ServerPlayer player, Vec3 original) {
+        return resolveSafePoint(player, original) != null;
+    }
+
+    private static Vec3 resolveSafePoint(ServerPlayer player, Vec3 original) {
+        int[] yOffsets = {0, 1, -1, 2, -2};
+        for (int radius = 0; radius <= 3; radius++) {
+            for (int dx = -radius; dx <= radius; dx++) {
+                for (int dz = -radius; dz <= radius; dz++) {
+                    for (int dy : yOffsets) {
+                        Vec3 candidate = original.add(dx, dy, dz);
+                        if (safeLocation(player, candidate)) return candidate;
+                    }
+                }
+            }
+        }
+        return null;
+    }
+
+    private static void empower(ServerPlayer player) {
+        ServerLevel level = player.serverLevel();
+        PlayerState s = state(player);
+        long now = level.getGameTime();
+        if (s.empoweredUntil > now) { action(player, "message.enderkatana.empower_active"); return; }
+        int cost = KatanaConfig.EMPOWERED_MODE_COST.get();
+        if (s.energy < cost) { action(player, "message.enderkatana.not_enough_energy"); return; }
+        s.energy -= cost;
+        s.empoweredUntil = now + 120;
+        AttributeInstance speed = player.getAttribute(Attributes.ATTACK_SPEED);
+        if (speed != null) {
+            speed.removeModifier(ATTACK_SPEED_ID);
+            speed.addTransientModifier(new AttributeModifier(ATTACK_SPEED_ID, .45, AttributeModifier.Operation.ADD_VALUE));
+        }
+        player.addEffect(new MobEffectInstance(MobEffects.DAMAGE_BOOST, 120, 0, false, false, true));
+        ring(level, player.position().add(0, 1, 0), 44, 1.3, ParticleTypes.REVERSE_PORTAL);
+        level.playSound(null, player.blockPosition(), ModSounds.EMPOWER.get(), SoundSource.PLAYERS, 1.0F, .8F);
+        action(player, "message.enderkatana.empower_started");
+    }
+
+    private static void dragonWrath(ServerPlayer player) {
+        PlayerState s = state(player);
+        ServerLevel level = player.serverLevel();
+        long now = level.getGameTime();
+        if (s.pendingUltimateAt >= 0) return;
+        if (now < s.ultimateReadyAt) { cooldownMessage(player, s.ultimateReadyAt - now); return; }
+        int cost = KatanaConfig.ULTIMATE_ENERGY_COST.get();
+        if (s.energy < cost) { action(player, "message.enderkatana.ultimate_requires_full"); return; }
+        s.energy = 0;
+        s.ultimateReadyAt = now + KatanaConfig.ULTIMATE_COOLDOWN_TICKS.get();
+        s.pendingUltimateAt = now + KatanaConfig.ULTIMATE_WINDUP_TICKS.get();
+        s.ultimateOrigin = player.position();
+        s.ultimateAbsolute = isAbsolute(player);
+        ring(level, player.position().add(0, .2, 0), 64, 2.7, ParticleTypes.PORTAL);
+        level.playSound(null, player.blockPosition(), ModSounds.CHARGE.get(), SoundSource.PLAYERS, 1.0F, .8F);
+        action(player, "message.enderkatana.ultimate_windup");
+        if (s.ultimateAbsolute) freezeNearby(player, 6.5, 8);
+    }
+
+    private static void executeUltimate(ServerPlayer player, PlayerState s) {
+        ServerLevel level = player.serverLevel();
+        Vec3 center = s.ultimateOrigin == null ? player.position() : s.ultimateOrigin;
+        boolean absolute = s.ultimateAbsolute;
+        double radius = KatanaConfig.ULTIMATE_RADIUS.get() * (absolute ? 1.15 : 1.0);
+        ring(level, center.add(0, .15, 0), 96, radius * .5, ParticleTypes.REVERSE_PORTAL);
+        ring(level, center.add(0, .2, 0), 72, radius * .35, ParticleTypes.DRAGON_BREATH);
+        level.sendParticles(ParticleTypes.EXPLOSION, center.x, center.y + 1, center.z, 8, 1.2, .8, 1.2, .1);
+        level.playSound(null, BlockPos.containing(center), ModSounds.CATASTROPHE.get(), SoundSource.PLAYERS, 1.5F, .72F);
+
+        if (absolute) {
+            List<LivingEntity> chainTargets = level.getEntitiesOfClass(LivingEntity.class,
+                    new AABB(center, center).inflate(radius), e -> e != player && e.isAlive() && !e.isAlliedTo(player))
+                    .stream().sorted(Comparator.comparingDouble(e -> e.position().distanceToSqr(player.position()))).limit(3).toList();
+            for (LivingEntity target : chainTargets) {
+                Vec3 old = player.position();
+                Vec3 behind = target.position().subtract(target.getLookAngle().normalize().scale(1.3)).add(0, .1, 0);
+                if (safeLocation(player, behind)) safeTeleport(player, behind);
+                ring(level, old.add(0, .8, 0), 14, .6, ParticleTypes.PORTAL);
+                ring(level, player.position().add(0, .8, 0), 14, .6, ParticleTypes.REVERSE_PORTAL);
+                target.hurt(player.damageSources().playerAttack(player), 4.0F);
+            }
+        }
+        List<LivingEntity> targets = level.getEntitiesOfClass(LivingEntity.class,
+                new AABB(center, center).inflate(radius), e -> e != player && e.isAlive() && !e.isAlliedTo(player));
+        for (LivingEntity target : targets) {
+            double damage = isBoss(target) ? KatanaConfig.BOSS_ULTIMATE_DAMAGE.get() : KatanaConfig.ULTIMATE_DAMAGE.get();
+            target.hurt(player.damageSources().playerAttack(player), damage);
+            ring(level, target.position().add(0, target.getBbHeight() * .55, 0), 18, .9, ParticleTypes.REVERSE_PORTAL);
+        }
+        if (absolute) freezeNearby(player, radius, 12);
+    }
+
+    private static void freezeNearby(ServerPlayer player, double radius, int bossTicks) {
+        ServerLevel level = player.serverLevel();
+        for (LivingEntity target : level.getEntitiesOfClass(LivingEntity.class,
+                player.getBoundingBox().inflate(radius), e -> e != player && e.isAlive() && !e.isAlliedTo(player))) {
+            int duration = isBoss(target) ? bossTicks : 20;
+            target.addEffect(new MobEffectInstance(MobEffects.MOVEMENT_SLOWDOWN, duration, 255, false, false, true), player);
+            level.sendParticles(ParticleTypes.END_ROD, target.getX(), target.getY() + target.getBbHeight() * .5, target.getZ(), 6, .35, .35, .35, .01);
+        }
+    }
+
+    public static void onLivingDeath(LivingEntity dead, DamageSource source) {
+        if (!(source.getEntity() instanceof ServerPlayer killer)) return;
+        PlayerState s = state(killer);
+        if (s.markedTarget == dead && killer.serverLevel().getGameTime() <= s.markExpiresAt) {
+            addEnergy(s, 15);
+            ring(killer.serverLevel(), dead.position(), 20, .7, ParticleTypes.REVERSE_PORTAL);
+            s.markedTarget = null;
+            action(killer, "message.enderkatana.energy_returned");
+        }
+        if (dead instanceof EnderDragon) {
+            upgradeKatana(killer);
+        }
+    }
+
+    private static void upgradeKatana(ServerPlayer player) {
+        boolean upgraded = false;
+        for (int i = 0; i < player.getInventory().items.size(); i++) {
+            ItemStack old = player.getInventory().items.get(i);
+            if (old.is(ModItems.ENDER_KATANA.get())) {
+                ItemStack absolute = new ItemStack(ModItems.ABSOLUTE_KATANA.get());
+                absolute.setDamageValue(Math.min(absolute.getMaxDamage() - 1, old.getDamageValue()));
+                player.getInventory().items.set(i, absolute);
+                upgraded = true;
+            }
+        }
+        if (player.getOffhandItem().is(ModItems.ENDER_KATANA.get())) {
+            ItemStack old = player.getOffhandItem();
+            ItemStack absolute = new ItemStack(ModItems.ABSOLUTE_KATANA.get());
+            absolute.setDamageValue(Math.min(absolute.getMaxDamage() - 1, old.getDamageValue()));
+            player.getInventory().offhand.set(0, absolute);
+            upgraded = true;
+        }
+        if (upgraded) {
+            player.serverLevel().playSound(null, player.blockPosition(), ModSounds.CATASTROPHE.get(), SoundSource.PLAYERS, 1.0F, 1.0F);
+            ring(player.serverLevel(), player.position().add(0, 1, 0), 70, 1.8, ParticleTypes.REVERSE_PORTAL);
+            action(player, "message.enderkatana.absolute_unlocked");
+        }
+    }
+
+    public static void onPlayerTick(ServerPlayer player) {
+        tick(player);
+    }
+
+    public static void onLogout(Player player) {
+        PlayerState s = STATES.remove(player.getUUID());
+        if (s != null) removeAttackSpeedModifier(player);
+    }
+
+    private static LivingEntity nearestLookTarget(ServerPlayer player, double reach) {
+        ServerLevel level = player.serverLevel();
+        Vec3 start = player.getEyePosition();
+        Vec3 direction = player.getLookAngle().normalize();
+        Vec3 end = start.add(direction.scale(reach));
+        BlockHitResult blockHit = level.clip(new ClipContext(start, end, ClipContext.Block.COLLIDER, ClipContext.Fluid.NONE, player));
+        double max = blockHit.getType() == HitResult.Type.BLOCK ? start.distanceTo(blockHit.getLocation()) : reach;
+        AABB search = player.getBoundingBox().expandTowards(direction.scale(max)).inflate(1.5);
+        return level.getEntitiesOfClass(LivingEntity.class, search, e -> e != player && e.isAlive() && !e.isAlliedTo(player) && player.hasLineOfSight(e))
+                .stream().filter(e -> {
+                    Vec3 delta = e.getBoundingBox().getCenter().subtract(start);
+                    double along = delta.dot(direction);
+                    return along >= 0 && along <= max && delta.subtract(direction.scale(along)).length() < 1.4;
+                }).min(Comparator.comparingDouble(e -> e.position().distanceToSqr(player.position()))).orElse(null);
+    }
+
+    private static LivingEntity nearestTarget(ServerPlayer player, Vec3 point, double radius) {
+        return player.serverLevel().getEntitiesOfClass(LivingEntity.class, new AABB(point, point).inflate(radius),
+                        e -> e != player && e.isAlive() && !e.isAlliedTo(player))
+                .stream().min(Comparator.comparingDouble(e -> e.position().distanceToSqr(point))).orElse(null);
+    }
+
+    private static boolean safeTeleport(ServerPlayer player, Vec3 destination) {
+        if (!safeLocation(player, destination)) return false;
+        player.teleportTo(destination.x, destination.y, destination.z);
+        return true;
+    }
+
+    private static boolean safeLocation(ServerPlayer player, Vec3 destination) {
+        ServerLevel level = player.serverLevel();
+        if (!Double.isFinite(destination.x) || !Double.isFinite(destination.y) || !Double.isFinite(destination.z)) return false;
+        if (destination.y < level.getMinBuildHeight() + 2 || destination.y >= level.getMaxBuildHeight() - 2) return false;
+        BlockPos feet = BlockPos.containing(destination.x, destination.y, destination.z);
+        BlockPos head = feet.above();
+        if (!level.getFluidState(feet).isEmpty() || !level.getFluidState(head).isEmpty()) return false;
+        BlockState feetState = level.getBlockState(feet);
+        BlockState headState = level.getBlockState(head);
+        if (feetState.isSuffocating(level, feet) || headState.isSuffocating(level, head)) return false;
+        AABB moved = player.getBoundingBox().move(destination.subtract(player.position()));
+        return level.noCollision(player, moved);
+    }
+
+    private static double limitBossDamage(LivingEntity target, double damage) {
+        return isBoss(target) ? Math.min(damage, Math.max(1.0, target.getMaxHealth() * .08)) : damage;
+    }
+
+    private static boolean isBoss(LivingEntity entity) {
+        return entity instanceof EnderDragon || entity instanceof WitherBoss || entity.getMaxHealth() >= 300.0F;
+    }
+
+    private static void spatialBurst(ServerPlayer player, Vec3 center, double radius, double damage, boolean large) {
+        ServerLevel level = player.serverLevel();
+        ring(level, center, large ? 36 : 20, radius * .65, ParticleTypes.REVERSE_PORTAL);
+        level.sendParticles(ParticleTypes.EXPLOSION, center.x, center.y, center.z, 1, .2, .2, .2, 0);
+        for (LivingEntity target : level.getEntitiesOfClass(LivingEntity.class, new AABB(center, center).inflate(radius),
+                e -> e != player && e.isAlive() && !e.isAlliedTo(player))) {
+            target.hurt(player.damageSources().playerAttack(player), limitBossDamage(target, damage));
+        }
+    }
+
+    private static void ring(ServerLevel level, Vec3 center, int count, double radius, net.minecraft.core.particles.ParticleOptions particle) {
+        for (int i = 0; i < count; i++) {
+            double angle = Math.PI * 2.0 * i / count;
+            double x = center.x + Math.cos(angle) * radius;
+            double z = center.z + Math.sin(angle) * radius;
+            double y = center.y + Math.sin(angle * 2.0) * radius * .12;
+            level.sendParticles(particle, x, y, z, 1, .025, .025, .025, .005);
+        }
+    }
+
+    private static void removeAttackSpeedModifier(Player player) {
+        AttributeInstance speed = player.getAttribute(Attributes.ATTACK_SPEED);
+        if (speed != null) speed.removeModifier(ATTACK_SPEED_ID);
+    }
+
+    private static void addEnergy(PlayerState s, int amount) {
+        s.energy = Math.max(0, Math.min(100, s.energy + amount));
+    }
+
+    private static void action(ServerPlayer player, String translationKey) {
+        player.displayClientMessage(Component.translatable(translationKey), true);
+    }
+
+    private static void cooldownMessage(ServerPlayer player, long ticks) {
+        int seconds = (int) Math.ceil(ticks / 20.0);
+        player.displayClientMessage(Component.translatable("message.enderkatana.cooldown", seconds), true);
+    }
+
+    private static final class PlayerState {
+        int energy;
+        int comboStep;
+        long lastHitAt;
+        long dashReadyAt;
+        long slashReadyAt;
+        long markExpiresAt;
+        LivingEntity markedTarget;
+        Vec3 returnPoint;
+        ResourceKey<Level> returnDimension;
+        long returnExpiresAt;
+        long empoweredUntil;
+        long pendingUltimateAt = -1;
+        long ultimateReadyAt;
+        Vec3 ultimateOrigin;
+        boolean ultimateAbsolute;
+    }
+}

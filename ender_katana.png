@@ -1,0 +1,8 @@
+{
+  "rift": { "sounds": [{ "name": "enderkatana:rift", "volume": 0.9, "pitch": 1.0 }] },
+  "slash": { "sounds": [{ "name": "enderkatana:slash", "volume": 0.85, "pitch": 1.0 }] },
+  "mark": { "sounds": [{ "name": "enderkatana:mark", "volume": 0.8, "pitch": 1.0 }] },
+  "empower": { "sounds": [{ "name": "enderkatana:empower", "volume": 0.85, "pitch": 1.0 }] },
+  "charge": { "sounds": [{ "name": "enderkatana:charge", "volume": 0.9, "pitch": 1.0 }] },
+  "catastrophe": { "sounds": [{ "name": "enderkatana:catastrophe", "volume": 1.0, "pitch": 1.0 }] }
+}

@@ -1,0 +1,24 @@
+package com.voidforge.enderkatana.registry;
+
+import com.voidforge.enderkatana.EnderKatana;
+import net.minecraft.core.registries.Registries;
+import net.minecraft.resources.ResourceLocation;
+import net.minecraft.sounds.SoundEvent;
+import net.neoforged.neoforge.registries.DeferredRegister;
+import java.util.function.Supplier;
+
+public final class ModSounds {
+    public static final DeferredRegister<SoundEvent> SOUNDS = DeferredRegister.create(Registries.SOUND_EVENT, EnderKatana.MOD_ID);
+    public static final Supplier<SoundEvent> RIFT = sound("rift");
+    public static final Supplier<SoundEvent> SLASH = sound("slash");
+    public static final Supplier<SoundEvent> MARK = sound("mark");
+    public static final Supplier<SoundEvent> EMPOWER = sound("empower");
+    public static final Supplier<SoundEvent> CHARGE = sound("charge");
+    public static final Supplier<SoundEvent> CATASTROPHE = sound("catastrophe");
+
+    private static Supplier<SoundEvent> sound(String name) {
+        return SOUNDS.register(name, () -> SoundEvent.createVariableRangeEvent(ResourceLocation.fromNamespaceAndPath(EnderKatana.MOD_ID, name)));
+    }
+
+    private ModSounds() {}
+}

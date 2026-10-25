@@ -1,0 +1,19 @@
+package com.voidforge.enderkatana.registry;
+
+import com.voidforge.enderkatana.EnderKatana;
+import com.voidforge.enderkatana.item.EnderKatanaItem;
+import net.minecraft.world.item.Item;
+import net.neoforged.neoforge.registries.DeferredRegister;
+import java.util.function.Supplier;
+
+public final class ModItems {
+    public static final DeferredRegister.Items ITEMS = DeferredRegister.createItems(EnderKatana.MOD_ID);
+
+    public static final Supplier<Item> ENDER_KATANA = ITEMS.register("ender_katana", () -> new EnderKatanaItem(false));
+    public static final Supplier<Item> ABSOLUTE_KATANA = ITEMS.register("absolute_void_katana", () -> new EnderKatanaItem(true));
+    public static final Supplier<Item> VOID_SHARD = ITEMS.registerSimpleItem("void_shard", new Item.Properties().fireResistant());
+    public static final Supplier<Item> DRAGON_CORE = ITEMS.registerSimpleItem("dragon_core", new Item.Properties().fireResistant());
+    public static final Supplier<Item> END_CITY_RELIC = ITEMS.registerSimpleItem("end_city_relic", new Item.Properties().fireResistant());
+
+    private ModItems() {}
+}
